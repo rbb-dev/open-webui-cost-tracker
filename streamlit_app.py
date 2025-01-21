@@ -18,7 +18,7 @@ import plotly.express as px
 import streamlit as st
 
 
-@st.cache
+@st.@st.cache_data
 def load_data(file: Any) -> Optional[List[Dict[str, Any]]]:
     """Load data from a JSON file.
 
