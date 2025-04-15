@@ -49,32 +49,47 @@ def process_data(data: List[Dict[str, Any]]) -> pd.DataFrame:
         A pandas DataFrame with processed data.
     """
     processed_data = []
-    # Iterate through each user (key) and their list of records (value)
-    for user_email, records in data.items():
-        for record in records:
+    # Iterate through each record in the list
+    for record in data:
+        try:
             timestamp = datetime.datetime.strptime(
                 record["timestamp"], "%Y-%m-%dT%H:%M:%S.%f"
             )
             month = timestamp.strftime("%Y-%m")
             model = record["model"]
             cost = record["total_cost"]
-            try:
-                if isinstance(cost, str):
-                    cost = float(cost)
-            except ValueError:
-                st.error(f"Invalid cost value for model {model} for user {user_email}.")
-                continue
+            user_email = record["user"] # Get user email directly from the record
+
+            # Ensure cost is a float
+            if isinstance(cost, str):
+                cost = float(cost)
+
             total_tokens = record["input_tokens"] + record["output_tokens"]
-            # Use the user_email from the dictionary key
+
             processed_data.append(
                 {
                     "month": month,
                     "model": model,
                     "total_cost": cost,
-                    "user": user_email,  # Assign the user email here
+                    "user": user_email,
                     "total_tokens": total_tokens,
                 }
-        )
+            )
+        except KeyError as e:
+            st.error(f"Missing key in record: {e}. Record: {record}")
+            continue
+        except ValueError:
+            st.error(f"Invalid cost or token value in record: {record}")
+            continue
+        except Exception as e:
+            st.error(f"An error occurred processing record: {record}. Error: {e}")
+            continue
+
+    if not processed_data:
+        st.warning("No valid data found to process.")
+        # Return an empty DataFrame with expected columns to avoid downstream errors
+        return pd.DataFrame(columns=["month", "model", "total_cost", "user", "total_tokens"])
+
     return pd.DataFrame(processed_data)
 
 
