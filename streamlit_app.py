@@ -17,8 +17,11 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# Set page config as the first Streamlit command
+st.set_page_config(page_title="Cost Tracker App", page_icon="💵")
 
-@st.cache
+
+@st.cache_data
 def load_data(file: Any) -> Optional[List[Dict[str, Any]]]:
     """Load data from a JSON file.
 
@@ -46,29 +49,31 @@ def process_data(data: List[Dict[str, Any]]) -> pd.DataFrame:
         A pandas DataFrame with processed data.
     """
     processed_data = []
-    for record in data:
-        timestamp = datetime.datetime.strptime(
-            record["timestamp"], "%Y-%m-%dT%H:%M:%S.%f"
-        )
-        month = timestamp.strftime("%Y-%m")
-        model = record["model"]
-        cost = record["total_cost"]
-        try:
-            if isinstance(cost, str):
-                cost = float(cost)
-        except ValueError:
-            st.error(f"Invalid cost value for model {model}.")
-            continue
-        total_tokens = record["input_tokens"] + record["output_tokens"]
-        user = record["user"]
-        processed_data.append(
-            {
-                "month": month,
-                "model": model,
-                "total_cost": cost,
-                "user": user,
-                "total_tokens": total_tokens,
-            }
+    # Iterate through each user (key) and their list of records (value)
+    for user_email, records in data.items():
+        for record in records:
+            timestamp = datetime.datetime.strptime(
+                record["timestamp"], "%Y-%m-%dT%H:%M:%S.%f"
+            )
+            month = timestamp.strftime("%Y-%m")
+            model = record["model"]
+            cost = record["total_cost"]
+            try:
+                if isinstance(cost, str):
+                    cost = float(cost)
+            except ValueError:
+                st.error(f"Invalid cost value for model {model} for user {user_email}.")
+                continue
+            total_tokens = record["input_tokens"] + record["output_tokens"]
+            # Use the user_email from the dictionary key
+            processed_data.append(
+                {
+                    "month": month,
+                    "model": model,
+                    "total_cost": cost,
+                    "user": user_email,  # Assign the user email here
+                    "total_tokens": total_tokens,
+                }
         )
     return pd.DataFrame(processed_data)
 
@@ -121,21 +126,40 @@ def plot_data(data: pd.DataFrame, month: str) -> None:
     st.plotly_chart(fig_models_cost, use_container_width=True)
 
     # ---------------------------------
-    # User Cost Bar Plot (Total Cost)
+    # User Cost and Token Bar Plot
     # ---------------------------------
-    month_data_users = month_data.groupby("user")["total_cost"].sum().reset_index()
-    month_data_users = month_data_users.sort_values(by="total_cost", ascending=False)
-    month_data_users["total"] = month_data_users["total_cost"].sum()
-    month_data_users = pd.concat(
-        [
-            month_data_users,
-            pd.DataFrame(
-                {"user": ["Total"], "total_cost": [month_data_users["total"].iloc[0]]}
-            ),
-        ]
+    # Group by user and sum both total_cost and total_tokens
+    month_data_users = (
+        month_data.groupby("user")[["total_cost", "total_tokens"]]
+        .sum()
+        .reset_index()
     )
+    month_data_users = month_data_users.sort_values(by="total_cost", ascending=False)
+
+    # Calculate totals for cost and tokens
+    total_cost_sum = month_data_users["total_cost"].sum()
+    total_tokens_sum = month_data_users["total_tokens"].sum()
+
+    # Create the 'Total' row DataFrame
+    total_row = pd.DataFrame(
+        {
+            "user": ["Total"],
+            "total_cost": [total_cost_sum],
+            "total_tokens": [total_tokens_sum],
+        }
+    )
+
+    # Concatenate the original data with the 'Total' row
+    month_data_users = pd.concat([month_data_users, total_row], ignore_index=True)
+
+    # Plot only total cost for clarity, but keep tokens in the DataFrame
     fig_users = px.bar(
-        month_data_users, x="user", y="total_cost", title=f"Total Cost by User ({month})"
+        month_data_users[
+            month_data_users["user"] != "Total"
+        ],  # Exclude Total row from plot for better scale
+        x="user",
+        y="total_cost",
+        title=f"Total Cost by User ({month})",
     )
     st.plotly_chart(fig_users, use_container_width=True)
 
@@ -154,8 +178,6 @@ def plot_data(data: pd.DataFrame, month: str) -> None:
 
 
 def main():
-    st.set_page_config(page_title="Cost Tracker App", page_icon="💵")
-
     st.title("Cost Tracker for Open WebUI")
     st.divider()
 
