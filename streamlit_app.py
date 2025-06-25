@@ -20,7 +20,6 @@ import streamlit as st
 # Set page config as the first Streamlit command
 st.set_page_config(page_title="Cost Tracker App", page_icon="💵")
 
-
 @st.cache_data
 def load_data(file: Any) -> Optional[List[Dict[str, Any]]]:
     """Load data from a JSON file.
