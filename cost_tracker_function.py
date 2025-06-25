@@ -4,7 +4,7 @@ description: This function is designed to manage and calculate the costs associa
 author: bgeneto
 author_url: https://github.com/bgeneto/open-webui-cost-tracker
 funding_url: https://github.com/open-webui
-version: 0.3.0
+version: 0.3.1
 license: MIT
 requirements: requests, tiktoken, cachetools, pydantic
 environment_variables:
@@ -34,8 +34,7 @@ class Config:
     DATA_DIR = "data"
     CACHE_DIR = os.path.join(DATA_DIR, ".cache")
     USER_COST_FILE = os.path.join(
-        DATA_DIR,
-        f"costs-{datetime.now().year:04d}-{datetime.now().month:02d}.json"
+        DATA_DIR, f"costs-{datetime.now().year:04d}-{datetime.now().month:02d}.json"
     )
     CACHE_TTL = 432000  # try to keep model pricing json file for 5 days in the cache.
     CACHE_MAXSIZE = 16
@@ -79,33 +78,33 @@ class UserCostManager:
             json.dump(costs, cost_file, indent=4)
 
     def update_user_cost(
-            self,
-            user_email: str,
-            model: str,
-            input_tokens: int,
-            output_tokens: int,
-            total_cost: Decimal,
-        ):
-            costs = self._read_costs()
-            timestamp = datetime.now().isoformat()
+        self,
+        user_email: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        total_cost: Decimal,
+    ):
+        costs = self._read_costs()
+        timestamp = datetime.now().isoformat()
 
-            # Ensure costs is a list
-            if not isinstance(costs, list):
-                costs = []
+        # Ensure costs is a list
+        if not isinstance(costs, list):
+            costs = []
 
-            # Add new usage record directly to list
-            costs.append(
-                {
-                    "user": user_email,
-                    "model": model,
-                    "timestamp": timestamp,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_cost": str(total_cost),
-                }
-            )
+        # Add new usage record directly to list
+        costs.append(
+            {
+                "user": user_email,
+                "model": model,
+                "timestamp": timestamp,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_cost": str(total_cost),
+            }
+        )
 
-            self._write_costs(costs)
+        self._write_costs(costs)
 
 
 class ModelCostManager:
@@ -258,7 +257,9 @@ class ModelCostManager:
 
         # Final fallback: try fuzz.partial_ratio
         start = time.time()
-        partial_ratios = [(fuzz.partial_ratio(key, query_lower), key) for key in keys_lower]
+        partial_ratios = [
+            (fuzz.partial_ratio(key, query_lower), key) for key in keys_lower
+        ]
         best_ratio, best_key = max(partial_ratios, key=lambda x: x[0])
         end = time.time()
         if Config.DEBUG:
@@ -363,12 +364,7 @@ class Filter:
         Returns:
             str: sanitized model name
         """
-        prefixes = [
-            "openai/",
-            "github/",
-            "google_genai/",
-            "deepseek/"
-        ]
+        prefixes = ["openai/", "github/", "google_genai/", "deepseek/"]
         suffixes = ["-tuned"]
         # remove prefixes and suffixes
         for prefix in prefixes:
@@ -392,15 +388,41 @@ class Filter:
 
         return "\n".join([process_line(line) for line in content.split("\n")])
 
-    def _get_model(self, body):
-        if "model" in body:
-            return self._sanitize_model_name(body["model"])
+    def _is_custom_model(self, body: dict) -> bool:
+        """
+        Custom model olduğunu anlamak için body["model"]'in
+        custom prefix'ine bakıyoruz. Gerekirse burayı
+        kendi custom işaretinize göre değiştirin.
+        """
+        model_id = body.get("model", "")
+        return model_id.startswith("custom/") or model_id.startswith("custom:")
+
+    def _get_model(self, body: dict, model_obj: Optional[dict] = None) -> Optional[str]:
+        """
+        Sadece custom modellerde base_model_id kullan,
+        diğer durumlarda direkt body["model"]'i sanitize et.
+        """
+        # 1) Eğer incoming model_obj varsa ve custom model ise base_model_id kullan
+        if model_obj and isinstance(model_obj, dict):
+            base = model_obj.get("info", {}).get("base_model_id")
+            if base and self._is_custom_model(body):
+                return self._sanitize_model_name(base)
+
+        # 2) Normal model bloğu
+        model_id = body.get("model")
+        # bazı durumlarda open-webui 'model' parametresini model_obj['params']['model'] içinde geçiyor olabilir:
+        if not model_id and model_obj:
+            model_id = model_obj.get("params", {}).get("model")
+
+        if model_id:
+            return self._sanitize_model_name(model_id)
+
         return None
 
     async def inlet(
         self,
         body: dict,
-        __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        # __event_emitter__: Callable[[Any], Awaitable[None]] = None,
         __model__: Optional[dict] = None,
         __user__: Optional[dict] = None,
     ) -> dict:
@@ -412,15 +434,18 @@ class Filter:
         ).strip()
         self.input_tokens = len(enc.encode(input_content))
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": f"Processing {self.input_tokens} input tokens...",
-                    "done": False,
-                },
-            }
-        )
+        # await __event_emitter__(
+        #    {
+        #        "type": "status",
+        #        "data": {
+        #            "description": f"Processing {self.input_tokens} input tokens...",
+        #            "done": False,
+        #        },
+        #    }
+        # )
+
+        # Store model info for later use in outlet
+        self.model_info = __model__
 
         # add user email to payload in order to track costs
         if __user__:
@@ -438,77 +463,108 @@ class Filter:
     async def outlet(
         self,
         body: dict,
-        __event_emitter__: Callable[[Any], Awaitable[None]],
-        __model__: Optional[dict] = None,
-        __user__: Optional[dict] = None,
+        # __event_emitter__: Callable[[Any], Awaitable[None]],
+        model: Optional[dict] = None,
+        user: Optional[dict] = None,
     ) -> dict:
-
+        # --- 1) Süreyi al ---
         end_time = time.time()
-        elapsed_time = end_time - self.start_time
+        elapsed = end_time - self.start_time
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": "Computing number of output tokens...",
-                    "done": False,
-                },
-            }
-        )
+        # --- 2) "Computing number of output tokens..." durumu ---
+        # await __event_emitter__(
+        #    {
+        #        "type": "status",
+        #        "data": {
+        #            "description": "Computing number of output tokens...",
+        #            "done": False,
+        #        },
+        #    }
+        # )
 
-        model = self._get_model(body)
+        # --- 3) Model kimliğini belirle ve output token sayısını hesapla ---
+        model_obj = model or getattr(self, "model_info", None)
+        model_id = self._get_model(body, model_obj)
         enc = tiktoken.get_encoding("cl100k_base")
         output_tokens = len(enc.encode(get_last_assistant_message(body["messages"])))
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {"description": "Computing total costs...", "done": False},
-            }
-        )
+        # --- 4) "Computing total costs..." durumu ---
+        # await __event_emitter__(
+        #    {
+        #        "type": "status",
+        #        "data": {
+        #            "description": "Computing total costs...",
+        #            "done": False,
+        #        },
+        #    }
+        # )
 
+        # --- 5) Maliyet hesaplama ---
         total_cost = self.cost_calculator.calculate_costs(
-            model, self.input_tokens, output_tokens, self.valves.compensation
+            model_id,
+            self.input_tokens,
+            output_tokens,
+            self.valves.compensation,
         )
 
-        if __user__:
-            if "email" in __user__:
-                user_email = __user__["email"]
-                try:
-                    self.user_cost_manager.update_user_cost(
-                        user_email,
-                        model,
-                        self.input_tokens,
-                        output_tokens,
-                        total_cost,
-                    )
-                except Exception as _:
-                    print("**ERROR: Unable to update user cost file!")
-            else:
-                print("**ERROR: User email not found!")
+        # --- 6) Kullanıcı maliyet kaydını güncelle ---
+        if user and "email" in user:
+            try:
+                self.user_cost_manager.update_user_cost(
+                    user["email"],
+                    model_id,
+                    self.input_tokens,
+                    output_tokens,
+                    total_cost,
+                )
+            except Exception:
+                print("**ERROR: Unable to update user cost file!")
         else:
-            print("**ERROR: User not found!")
+            print("**ERROR: User email not found!")
 
-        tokens = self.input_tokens + output_tokens
-        tokens_per_sec = tokens / elapsed_time
-        stats_array = []
-
+        # --- 7) İstatistik dizisini oluştur ---
+        total_tokens = self.input_tokens + output_tokens
+        tps = total_tokens / max(elapsed, 1e-6)
+        stats_parts = []
         if self.valves.elapsed_time:
-            stats_array.append(f"{elapsed_time:.2f} s")
+            stats_parts.append(f"{elapsed:.2f} s")
         if self.valves.tokens_per_sec:
-            stats_array.append(f"{tokens_per_sec:.2f} T/s")
+            stats_parts.append(f"{tps:.2f} T/s")
         if self.valves.number_of_tokens:
-            stats_array.append(f"{tokens} Tokens")
-
+            stats_parts.append(f"{total_tokens} Tokens")
+        # Küçük tutarlar için format
         if float(total_cost) < float(Config.DECIMALS):
-            stats_array.append(f"${total_cost:.2f}")
+            stats_parts.append(f"${total_cost:.2f}")
         else:
-            stats_array.append(f"${total_cost:.6f}")
+            stats_parts.append(f"${total_cost:.6f}")
+        stats_str = " | ".join(stats_parts)
 
-        stats = " | ".join(stats_array)
+        # --- 8) Son assistant mesajına gömme (hem assistant_message hem messages için) ---
+        # 8a) assistant_message objesi varsa
+        if (
+            "assistant_message" in body
+            and body["assistant_message"].get("role") == "assistant"
+        ):
+            m = body["assistant_message"]
+            m["content"] = (
+                m["content"].rstrip() + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
+            )
+        else:
+            # 8b) fallback olarak messages listesindeki son assistant
+            for m in reversed(body.get("messages", [])):
+                if m.get("role") == "assistant":
+                    m["content"] = (
+                        m["content"].rstrip()
+                        + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
+                    )
+                    break
 
-        await __event_emitter__(
-            {"type": "status", "data": {"description": stats, "done": True}}
-        )
+        # --- 9) Son durumu emit et (opsiyonel) ---
+        # await __event_emitter__(
+        #    {
+        #        "type": "status",
+        #        "data": {"description": stats_str, "done": True},
+        #    }
+        # )
 
         return body
