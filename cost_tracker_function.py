@@ -1,16 +1,15 @@
 """
-title: Cost Tracker for Open WebUI
-description: This function is designed to manage and calculate the costs associated with user interactions and model usage in a Open WebUI.
-author: bgeneto
-author_url: https://github.com/bgeneto/open-webui-cost-tracker
+title: Live Cost Tracker when Chatting
+description: Manages and calculates costs for model usage in the Chat
+authors: brammittendorff
+author_url: https://github.com/brammittendorff/openwebui-pipelines
 funding_url: https://github.com/open-webui
-version: 0.3.1
+version: 0.0.2
 license: MIT
 requirements: requests, tiktoken, cachetools, pydantic
 environment_variables:
-disclaimer: This function is provided as is without any guarantees.
-            It is your responsibility to ensure that the function meets your requirements.
-            All metrics and costs are approximate and may vary depending on the model and the usage.
+disclaimer: Provided as-is without warranties.
+            You must ensure it meets your needs.
 """
 
 import hashlib
@@ -25,57 +24,60 @@ from typing import Any, Awaitable, Callable, Optional
 import requests
 import tiktoken
 from cachetools import TTLCache, cached
-from open_webui.utils.misc import get_last_assistant_message, get_messages_content
 from pydantic import BaseModel, Field
-from rapidfuzz import fuzz
 
 
 class Config:
     DATA_DIR = "data"
     CACHE_DIR = os.path.join(DATA_DIR, ".cache")
-    USER_COST_FILE = os.path.join(
-        DATA_DIR, f"costs-{datetime.now().year:04d}-{datetime.now().month:02d}.json"
+    USER_COST_FILE = os.path.join(DATA_DIR, f"costs-{datetime.now().year}.json")
+
+    # Use the new remote JSON with model pricing
+    REMOTE_JSON_URL = (
+        "https://raw.githubusercontent.com/"
+        "/rbb-dev/openwebui-pipelines/refs/heads/main/json/model_pricing.json"
     )
-    CACHE_TTL = 432000  # try to keep model pricing json file for 5 days in the cache.
-    CACHE_MAXSIZE = 16
+
+    CACHE_TTL = 432000  # e.g., 5 days
+    CACHE_MAXSIZE = 8
     DECIMALS = "0.00000001"
-    DEBUG_PREFIX = "DEBUG:    " + __name__.upper() + " -"
-    INFO_PREFIX = "INFO:     " + __name__.upper() + " -"
     DEBUG = False
 
 
-# Initialize cache
-cache = TTLCache(maxsize=Config.CACHE_MAXSIZE, ttl=Config.CACHE_TTL)
+def debug_print(msg: str):
+    if Config.DEBUG:
+        print("[COST TRACKER DEBUG] " + msg)
 
 
-def get_encoding(model):
+def get_encoding_for_model(model_name: str):
+    """
+    Safely get a tiktoken encoding for the given model_name,
+    falling back to 'cl100k_base' if unknown.
+    """
     try:
-        return tiktoken.encoding_for_model(model)
+        return tiktoken.encoding_for_model(model_name)
     except KeyError:
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Encoding for model {model} not found. Using cl100k_base for computing tokens."
-            )
+        debug_print(f"Unknown encoding for model={model_name}, using cl100k_base.")
         return tiktoken.get_encoding("cl100k_base")
 
 
 class UserCostManager:
-    def __init__(self, cost_file_path):
+    def __init__(self, cost_file_path: str):
         self.cost_file_path = cost_file_path
         self._ensure_cost_file_exists()
 
     def _ensure_cost_file_exists(self):
         if not os.path.exists(self.cost_file_path):
-            with open(self.cost_file_path, "w", encoding="UTF-8") as cost_file:
-                json.dump({}, cost_file)
+            with open(self.cost_file_path, "w", encoding="UTF-8") as f:
+                json.dump({}, f)
 
-    def _read_costs(self):
-        with open(self.cost_file_path, "r", encoding="UTF-8") as cost_file:
-            return json.load(cost_file)
+    def _read_costs(self) -> dict:
+        with open(self.cost_file_path, "r", encoding="UTF-8") as f:
+            return json.load(f)
 
-    def _write_costs(self, costs):
-        with open(self.cost_file_path, "w", encoding="UTF-8") as cost_file:
-            json.dump(costs, cost_file, indent=4)
+    def _write_costs(self, costs: dict):
+        with open(self.cost_file_path, "w", encoding="UTF-8") as f:
+            json.dump(costs, f, indent=2)
 
     def update_user_cost(
         self,
@@ -85,486 +87,266 @@ class UserCostManager:
         output_tokens: int,
         total_cost: Decimal,
     ):
-        costs = self._read_costs()
-        timestamp = datetime.now().isoformat()
+        """
+        Append a cost record for the given user & model to the JSON file.
+        """
+        costs_data = self._read_costs()
+        if user_email not in costs_data:
+            costs_data[user_email] = []
 
-        # Ensure costs is a list
-        if not isinstance(costs, list):
-            costs = []
-
-        # Add new usage record directly to list
-        costs.append(
+        costs_data[user_email].append(
             {
-                "user": user_email,
                 "model": model,
-                "timestamp": timestamp,
+                "timestamp": datetime.now().isoformat(),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_cost": str(total_cost),
             }
         )
+        self._write_costs(costs_data)
 
-        self._write_costs(costs)
+
+cache = TTLCache(maxsize=Config.CACHE_MAXSIZE, ttl=Config.CACHE_TTL)
 
 
 class ModelCostManager:
-    _best_match_cache = {}
+    _lock = Lock()
 
-    def __init__(self, cache_dir=Config.CACHE_DIR):
-        self.cache_dir = cache_dir
-        self.lock = Lock()
-        self.url = "https://github.com/rbb-dev/open-webui-cost-tracker/raw/refs/heads/main/model_prices_and_context_window.json"
-        self.cache_file_path = self._get_cache_filename()
-        self._ensure_cache_dir()
-
-    def _ensure_cache_dir(self):
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
-
-    def _get_cache_filename(self):
-        cache_file_name = hashlib.sha256(self.url.encode()).hexdigest() + ".json"
-        return os.path.normpath(os.path.join(self.cache_dir, cache_file_name))
-
-    def _is_cache_valid(self, cache_file_path):
-        cache_file_mtime = os.path.getmtime(cache_file_path)
-        return time.time() - cache_file_mtime < cache.ttl
+    def __init__(self, remote_url: str, fallback_dict: dict):
+        self.remote_url = remote_url
+        self.fallback_dict = fallback_dict  # now empty
+        self.cached_data = None  # Will store the remote JSON data (if downloaded)
+        self.cache_file = os.path.join(Config.CACHE_DIR, "model_prices.json")
+        os.makedirs(Config.CACHE_DIR, exist_ok=True)
 
     @cached(cache=cache)
-    def get_cost_data(self):
+    def fetch_remote_data(self) -> dict:
         """
-        Fetches a JSON file from a URL and stores it in cache.
-
-        This method attempts to retrieve a JSON file from the specified URL. To optimize performance and reduce
-        network requests, it caches the JSON data locally. If the cached data is available and still valid,
-        it returns the cached data instead of making a new network request. If the cached data is not available
-        or has expired, it fetches the data from the URL, caches it, and then returns it.
-
-        Returns:
-            dict: The JSON data retrieved from the URL or the cache.
-
-        Raises:
-            requests.RequestException: If the network request fails and no valid cache is available.
+        Attempt to download remote JSON. If that fails, return empty dict.
         """
-
-        with self.lock:
-            if os.path.exists(self.cache_file_path) and self._is_cache_valid(
-                self.cache_file_path
-            ):
-                with open(self.cache_file_path, "r", encoding="UTF-8") as cache_file:
-                    if Config.DEBUG:
-                        print(
-                            f"{Config.DEBUG_PREFIX} Reading costs json file from disk!"
-                        )
-                    return json.load(cache_file)
+        if not self.remote_url:
+            return {}
         try:
-            if Config.DEBUG:
-                print(f"{Config.DEBUG_PREFIX} Downloading model costs json file!")
-            response = requests.get(self.url)
-            response.raise_for_status()
-            data = response.json()
-
-            # backup existing cache file
-            try:
-                if os.path.exists(self.cache_file_path):
-                    os.rename(self.cache_file_path, self.cache_file_path + ".bkp")
-            except Exception as e:
-                print(f"**ERROR: Failed to backup costs json file. Error: {e}")
-
-            with self.lock:
-                with open(self.cache_file_path, "w", encoding="UTF-8") as cache_file:
-                    if Config.DEBUG:
-                        print(f"{Config.DEBUG_PREFIX} Writing costs to json file!")
-                    json.dump(data, cache_file)
-
-            return data
+            debug_print(f"Attempting to fetch remote cost data from {self.remote_url}")
+            resp = requests.get(self.remote_url, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
         except Exception as e:
-            print(
-                f"**ERROR: Failed to download or write to costs json file. Using old cached file if available. Error: {e}"
-            )
-            with self.lock:
-                if os.path.exists(self.cache_file_path + ".bkp"):
-                    with open(
-                        self.cache_file_path + ".bkp", "r", encoding="UTF-8"
-                    ) as cache_file:
-                        if Config.DEBUG:
-                            print(
-                                f"{Config.DEBUG_PREFIX} Reading costs json file from backup!"
-                            )
-                        return json.load(cache_file)
-                else:
-                    raise e
-
-    def levenshtein_distance(self, s1, s2):
-        m, n = len(s1), len(s2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
-
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                cost = 0 if s1[i - 1] == s2[j - 1] else 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost
-                )
-
-        return dp[m][n]
-
-    def _find_best_match(self, query: str, json_data) -> str:
-        # Exact match search
-        query_lower = query.lower()
-        keys_lower = {key.lower(): key for key in json_data.keys()}
-
-        if query_lower in keys_lower:
-            return keys_lower[query_lower]
-
-        # If no exact match is found, try fuzzy partial matching
-        start = time.time()
-        partial_ratios = [(fuzz.ratio(key, query_lower), key) for key in keys_lower]
-        best_match, best_key = max(partial_ratios, key=lambda x: x[0])
-        end = time.time()
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Best fuzzy match for query '{query}' is '{best_key}' with ratio {best_match:.1f} in {end - start:.4f} seconds"
-            )
-        if best_match >= 79:
-            return best_key
-
-        # Fallback to Levenshtein distance matching as a last resort
-        threshold_ratio = 0.6 if len(query) < 15 else 0.3
-        min_distance = float("inf")
-        best_match = None
-        threshold = round(len(query) * threshold_ratio)
-
-        start = time.time()
-        distances = (self.levenshtein_distance(query_lower, key) for key in keys_lower)
-        for key, dist in zip(keys_lower.values(), distances):
-            if dist < min_distance:
-                min_distance = dist
-                best_match = key
-            if dist < 2:  # Early termination for (almost) exact match
-                return key
-        end = time.time()
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Levenshtein min. distance was {min_distance}. Search took {end - start:.3f} seconds"
-            )
-
-        if min_distance <= threshold:
-            return best_match
-
-        # Final fallback: try fuzz.partial_ratio
-        start = time.time()
-        partial_ratios = [
-            (fuzz.partial_ratio(key, query_lower), key) for key in keys_lower
-        ]
-        best_ratio, best_key = max(partial_ratios, key=lambda x: x[0])
-        end = time.time()
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Best partial ratio match for query '{query}' is '{best_key}' with ratio {best_ratio:.1f} in {end - start:.4f} seconds"
-            )
-        if best_ratio >= 80:  # Threshold for partial ratio
-            return best_key
-
-        return None
-
-    def get_model_data(self, model):
-        json_data = self.get_cost_data()
-
-        if model in ModelCostManager._best_match_cache:
-            if Config.DEBUG:
-                print(
-                    f"{Config.DEBUG_PREFIX} Using cached costs for model named '{model}'"
-                )
-            best_match = ModelCostManager._best_match_cache[model]
-        else:
-            if Config.DEBUG:
-                print(
-                    f"{Config.DEBUG_PREFIX} Searching best match in costs file for model named '{model}'"
-                )
-            best_match = self._find_best_match(model, json_data)
-            ModelCostManager._best_match_cache[model] = best_match
-
-        if best_match is None:
+            debug_print(f"Failed to fetch remote data: {e}")
             return {}
 
-        if Config.DEBUG:
-            print(f"{Config.DEBUG_PREFIX} Using costs from '{best_match}'")
+    def get_model_data(self, model: str) -> dict:
+        """
+        Return the cost data for a specific model with improved matching.
+        1) Try exact match in remote data
+        2) Try partial match if exact match fails
+        3) If not found, fallback to empty => zero cost
+        """
+        if not self.cached_data:
+            with self._lock:
+                if not self.cached_data:
+                    self.cached_data = self.fetch_remote_data()
+                    debug_print(
+                        f"Loaded model pricing data with {len(self.cached_data)} models"
+                    )
+                    debug_print(
+                        f"Available models: {list(self.cached_data.keys())[:5]}..."
+                    )
 
-        return json_data.get(best_match, {})
+        # First try exact match
+        if self.cached_data and model in self.cached_data:
+            debug_print(f"Found exact match for model '{model}'")
+            return self.cached_data[model]
+
+        # If exact match fails, try to find a partial match
+        # This handles cases where model names differ slightly
+        if self.cached_data:
+            # Try to match the model name without version numbers or prefixes
+            base_model = model.split("-")[0] if "-" in model else model
+            for key in self.cached_data.keys():
+                if base_model in key:
+                    debug_print(f"Found partial match for '{model}' using '{key}'")
+                    return self.cached_data[key]
+
+        # Otherwise fallback to empty => zero cost
+        debug_print(
+            f"No cost data found for '{model}' in remote data. Using zero cost."
+        )
+        return {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+        }
 
 
 class CostCalculator:
     def __init__(
         self, user_cost_manager: UserCostManager, model_cost_manager: ModelCostManager
     ):
-        self.model_cost_manager = model_cost_manager
         self.user_cost_manager = user_cost_manager
+        self.model_cost_manager = model_cost_manager
 
     def calculate_costs(
         self, model: str, input_tokens: int, output_tokens: int, compensation: float
     ) -> Decimal:
-        model_pricing_data = self.model_cost_manager.get_model_data(model)
-        if not model_pricing_data:
-            print(f"{Config.INFO_PREFIX} Model '{model}' not found in costs json file!")
-        input_cost_per_token = Decimal(
-            str(model_pricing_data.get("input_cost_per_token", 0))
-        )
-        output_cost_per_token = Decimal(
-            str(model_pricing_data.get("output_cost_per_token", 0))
-        )
+        """
+        Calculate the cost of input_tokens + output_tokens for the given model.
+        Use 'compensation' as a multiplier (e.g. 1.2 for 20% markup).
+        """
+        cost_data = self.model_cost_manager.get_model_data(model)
+        in_cpt = Decimal(str(cost_data.get("input_cost_per_token", 0)))
+        out_cpt = Decimal(str(cost_data.get("output_cost_per_token", 0)))
 
-        input_cost = input_tokens * input_cost_per_token
-        output_cost = output_tokens * output_cost_per_token
-        total_cost = Decimal(float(compensation)) * (input_cost + output_cost)
-        total_cost = total_cost.quantize(
-            Decimal(Config.DECIMALS), rounding=ROUND_HALF_UP
-        )
+        input_cost = Decimal(input_tokens) * in_cpt
+        output_cost = Decimal(output_tokens) * out_cpt
+        raw_total = input_cost + output_cost
+        final_cost = raw_total * Decimal(compensation)
 
-        return total_cost
+        # Round to the nearest DECIMALS
+        return final_cost.quantize(Decimal(Config.DECIMALS), rounding=ROUND_HALF_UP)
 
 
 class Filter:
     class Valves(BaseModel):
-        priority: int = Field(default=15, description="Priority level")
-        compensation: float = Field(
-            default=1.0, description="Compensation for price calculation (percent)"
-        )
-        elapsed_time: bool = Field(default=True, description="Display the elapsed time")
-        number_of_tokens: bool = Field(
-            default=True, description="Display total number of tokens"
-        )
-        tokens_per_sec: bool = Field(
-            default=True, description="Display tokens per second metric"
-        )
-        debug: bool = Field(default=False, description="Display debugging messages")
-        pass
+        compensation: float = Field(default=1.0, description="Price multiplier")
+        show_elapsed_time: bool = True
+        show_tokens: bool = True
+        show_tokens_per_second: bool = True
+        debug: bool = False
 
     def __init__(self):
         self.valves = self.Valves()
         Config.DEBUG = self.valves.debug
-        self.model_cost_manager = ModelCostManager()
+
         self.user_cost_manager = UserCostManager(Config.USER_COST_FILE)
+        # fallback_dict is now empty => only remote used
+        self.model_cost_manager = ModelCostManager(
+            remote_url=Config.REMOTE_JSON_URL, fallback_dict={}  # <--- now empty
+        )
         self.cost_calculator = CostCalculator(
             self.user_cost_manager, self.model_cost_manager
         )
-        self.start_time = None
+
         self.input_tokens = 0
-        pass
+        self.start_time = None
 
-    def _sanitize_model_name(self, name: str) -> str:
-        """Sanitize model name by removing prefixes and suffixes
-
-        Args:
-            name (str): model name
-
-        Returns:
-            str: sanitized model name
+    def _remove_roles(self, text: str) -> str:
         """
-        prefixes = ["openai/", "github/", "google_genai/", "deepseek/"]
-        suffixes = ["-tuned"]
-        # remove prefixes and suffixes
-        for prefix in prefixes:
-            if name.startswith(prefix):
-                name = name[len(prefix) :]
-        for suffix in suffixes:
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        return name.lower().strip()
-
-    def _remove_roles(self, content):
-        # Define the roles to be removed
-        roles = ["SYSTEM:", "USER:", "ASSISTANT:", "PROMPT:"]
-
-        # Process each line
-        def process_line(line):
-            for role in roles:
-                if line.startswith(role):
-                    return line.split(":", 1)[1].strip()
-            return line  # Return the line unchanged if no role matches
-
-        return "\n".join([process_line(line) for line in content.split("\n")])
-
-    def _is_custom_model(self, body: dict) -> bool:
+        Remove lines that begin with 'SYSTEM:', 'USER:', 'ASSISTANT:', or 'PROMPT:'.
         """
-        Custom model olduğunu anlamak için body["model"]'in
-        custom prefix'ine bakıyoruz. Gerekirse burayı
-        kendi custom işaretinize göre değiştirin.
-        """
-        model_id = body.get("model", "")
-        return model_id.startswith("custom/") or model_id.startswith("custom:")
-
-    def _get_model(self, body: dict, model_obj: Optional[dict] = None) -> Optional[str]:
-        """
-        Sadece custom modellerde base_model_id kullan,
-        diğer durumlarda direkt body["model"]'i sanitize et.
-        """
-        # 1) Eğer incoming model_obj varsa ve custom model ise base_model_id kullan
-        if model_obj and isinstance(model_obj, dict):
-            base = model_obj.get("info", {}).get("base_model_id")
-            if base and self._is_custom_model(body):
-                return self._sanitize_model_name(base)
-
-        # 2) Normal model bloğu
-        model_id = body.get("model")
-        # bazı durumlarda open-webui 'model' parametresini model_obj['params']['model'] içinde geçiyor olabilir:
-        if not model_id and model_obj:
-            model_id = model_obj.get("params", {}).get("model")
-
-        if model_id:
-            return self._sanitize_model_name(model_id)
-
-        return None
+        roles = ("SYSTEM:", "USER:", "ASSISTANT:", "PROMPT:")
+        lines = text.split("\n")
+        cleaned = []
+        for line in lines:
+            if any(line.startswith(r) for r in roles):
+                cleaned.append(line.split(":", 1)[1].strip())
+            else:
+                cleaned.append(line)
+        return "\n".join(cleaned).strip()
 
     async def inlet(
         self,
         body: dict,
-        # __event_emitter__: Callable[[Any], Awaitable[None]] = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
         __model__: Optional[dict] = None,
         __user__: Optional[dict] = None,
     ) -> dict:
+        """
+        Called before the main generation step:
+         - Count input tokens
+         - Possibly store user email
+         - Mark start_time
+        """
+        messages = body.get("messages", [])
+        content_str = "\n".join([m.get("content", "") for m in messages])
+        cleaned_text = self._remove_roles(content_str)
 
-        Config.DEBUG = self.valves.debug
-        enc = tiktoken.get_encoding("cl100k_base")
-        input_content = self._remove_roles(
-            get_messages_content(body["messages"])
-        ).strip()
-        self.input_tokens = len(enc.encode(input_content))
+        enc = get_encoding_for_model(body.get("model", "unknown-model"))
+        self.input_tokens = len(enc.encode(cleaned_text))
 
-        # await __event_emitter__(
-        #    {
-        #        "type": "status",
-        #        "data": {
-        #            "description": f"Processing {self.input_tokens} input tokens...",
-        #            "done": False,
-        #        },
-        #    }
-        # )
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Input tokens: {self.input_tokens}",
+                        "done": False,
+                    },
+                }
+            )
 
-        # Store model info for later use in outlet
-        self.model_info = __model__
-
-        # add user email to payload in order to track costs
-        if __user__:
-            if "email" in __user__:
-                if Config.DEBUG:
-                    print(
-                        f"{Config.DEBUG_PREFIX} Adding email to request body: {__user__['email']}"
-                    )
-                body["user"] = __user__["email"]
+        # If there's user info
+        if __user__ and "email" in __user__:
+            body["user"] = __user__["email"]
 
         self.start_time = time.time()
-
         return body
 
     async def outlet(
         self,
         body: dict,
-        # __event_emitter__: Callable[[Any], Awaitable[None]],
-        model: Optional[dict] = None,
-        user: Optional[dict] = None,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __model__: Optional[dict] = None,
+        __user__: Optional[dict] = None,
     ) -> dict:
-        # --- 1) Süreyi al ---
+        """
+        Called after the generation step:
+         - Count output tokens
+         - Compute cost
+         - Save cost
+         - Emit stats
+        """
         end_time = time.time()
         elapsed = end_time - self.start_time
 
-        # --- 2) "Computing number of output tokens..." durumu ---
-        # await __event_emitter__(
-        #    {
-        #        "type": "status",
-        #        "data": {
-        #            "description": "Computing number of output tokens...",
-        #            "done": False,
-        #        },
-        #    }
-        # )
+        messages = body.get("messages", [])
+        last_msg_content = messages[-1].get("content", "") if messages else ""
+        enc = get_encoding_for_model(body.get("model", "unknown-model"))
+        output_tokens = len(enc.encode(last_msg_content))
 
-        # --- 3) Model kimliğini belirle ve output token sayısını hesapla ---
-        model_obj = model or getattr(self, "model_info", None)
-        model_id = self._get_model(body, model_obj)
-        enc = tiktoken.get_encoding("cl100k_base")
-        output_tokens = len(enc.encode(get_last_assistant_message(body["messages"])))
-
-        # --- 4) "Computing total costs..." durumu ---
-        # await __event_emitter__(
-        #    {
-        #        "type": "status",
-        #        "data": {
-        #            "description": "Computing total costs...",
-        #            "done": False,
-        #        },
-        #    }
-        # )
-
-        # --- 5) Maliyet hesaplama ---
+        # Compute cost
+        model_name = body.get("model", "unknown-model")
         total_cost = self.cost_calculator.calculate_costs(
-            model_id,
-            self.input_tokens,
-            output_tokens,
-            self.valves.compensation,
+            model=model_name,
+            input_tokens=self.input_tokens,
+            output_tokens=output_tokens,
+            compensation=self.valves.compensation,
         )
 
-        # --- 6) Kullanıcı maliyet kaydını güncelle ---
-        if user and "email" in user:
+        # Save cost
+        user_email = None
+        if __user__:
+            user_email = __user__.get("email")
+        elif "user" in body:
+            user_email = body["user"]
+
+        if user_email:
             try:
                 self.user_cost_manager.update_user_cost(
-                    user["email"],
-                    model_id,
-                    self.input_tokens,
-                    output_tokens,
-                    total_cost,
+                    user_email, model_name, self.input_tokens, output_tokens, total_cost
                 )
-            except Exception:
-                print("**ERROR: Unable to update user cost file!")
-        else:
-            print("**ERROR: User email not found!")
+            except Exception as e:
+                debug_print(f"Error updating user cost: {e}")
 
-        # --- 7) İstatistik dizisini oluştur ---
         total_tokens = self.input_tokens + output_tokens
-        tps = total_tokens / max(elapsed, 1e-6)
-        stats_parts = []
-        if self.valves.elapsed_time:
-            stats_parts.append(f"{elapsed:.2f} s")
-        if self.valves.tokens_per_sec:
-            stats_parts.append(f"{tps:.2f} T/s")
-        if self.valves.number_of_tokens:
-            stats_parts.append(f"{total_tokens} Tokens")
-        # Küçük tutarlar için format
-        if float(total_cost) < float(Config.DECIMALS):
-            stats_parts.append(f"${total_cost:.2f}")
-        else:
-            stats_parts.append(f"${total_cost:.6f}")
-        stats_str = " | ".join(stats_parts)
+        tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
 
-        # --- 8) Son assistant mesajına gömme (hem assistant_message hem messages için) ---
-        # 8a) assistant_message objesi varsa
-        if (
-            "assistant_message" in body
-            and body["assistant_message"].get("role") == "assistant"
-        ):
-            m = body["assistant_message"]
-            m["content"] = (
-                m["content"].rstrip() + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
+        stats_list = []
+        if self.valves.show_elapsed_time:
+            stats_list.append(f"{elapsed:.2f} s")
+        if self.valves.show_tokens_per_second:
+            stats_list.append(f"{tokens_per_sec:.2f} T/s")
+        if self.valves.show_tokens:
+            stats_list.append(f"{total_tokens} Tokens")
+
+        # format cost
+        cost_str = f"${total_cost:.6f}"
+        stats_list.append(cost_str)
+
+        stats_string = " | ".join(stats_list)
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {"type": "status", "data": {"description": stats_string, "done": True}}
             )
-        else:
-            # 8b) fallback olarak messages listesindeki son assistant
-            for m in reversed(body.get("messages", [])):
-                if m.get("role") == "assistant":
-                    m["content"] = (
-                        m["content"].rstrip()
-                        + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
-                    )
-                    break
-
-        # --- 9) Son durumu emit et (opsiyonel) ---
-        # await __event_emitter__(
-        #    {
-        #        "type": "status",
-        #        "data": {"description": stats_str, "done": True},
-        #    }
-        # )
 
         return body
