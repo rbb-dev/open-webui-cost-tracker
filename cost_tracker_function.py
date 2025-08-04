@@ -113,7 +113,7 @@ class ModelCostManager:
     def __init__(self, cache_dir=Config.CACHE_DIR):
         self.cache_dir = cache_dir
         self.lock = Lock()
-        self.url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        self.url = "https://github.com/rbb-dev/open-webui-cost-tracker/raw/refs/heads/main/model_prices_and_context_window.json"
         self.cache_file_path = self._get_cache_filename()
         self._ensure_cache_dir()
 
