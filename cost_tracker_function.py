@@ -547,7 +547,7 @@ class Filter:
         ):
             m = body["assistant_message"]
             m["content"] = (
-                m["content"].rstrip() + f"\n\n---\n**Transaction Cost:** {stats_str}"
+                m["content"].rstrip() + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
             )
         else:
             # 8b) fallback olarak messages listesindeki son assistant
@@ -555,7 +555,7 @@ class Filter:
                 if m.get("role") == "assistant":
                     m["content"] = (
                         m["content"].rstrip()
-                        + f"\n\n---\n**Transaction Cost:** {stats_str}"
+                        + f"\n\n---\n**İşlem Ücreti:** {stats_str}"
                     )
                     break
 
